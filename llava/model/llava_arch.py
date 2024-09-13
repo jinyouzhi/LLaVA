@@ -25,6 +25,8 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 
 from llava.mm_utils import get_anyres_image_grid_shape
 
+import habana_frameworks.torch as htorch
+
 
 class LlavaMetaModel:
 
@@ -138,8 +140,11 @@ class LlavaMetaForCausalLM(ABC):
         return self.get_model().get_vision_tower()
 
     def encode_images(self, images):
+        htorch.core.mark_step()
         image_features = self.get_model().get_vision_tower()(images)
+        htorch.core.mark_step()
         image_features = self.get_model().mm_projector(image_features)
+        htorch.core.mark_step()
         return image_features
 
     def prepare_inputs_labels_for_multimodal(
@@ -204,6 +209,13 @@ class LlavaMetaForCausalLM(ABC):
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
             raise NotImplementedError
+        
+        if self.is_hpu:
+            input_ids = input_ids.cpu()
+            labels = labels.cpu()
+            if position_ids is not None:
+                position_ids = position_ids.cpu()
+            attention_mask = attention_mask.cpu()
 
         # Let's just add dummy tensors if they do not exist,
         # it is a headache to deal with None all the time.
@@ -262,7 +274,8 @@ class LlavaMetaForCausalLM(ABC):
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
-            cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
+            if not self.is_hpu:
+                cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
 
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
@@ -277,7 +290,8 @@ class LlavaMetaForCausalLM(ABC):
             new_labels = [x[:tokenizer_model_max_length] for x in new_labels]
 
         # Combine them
-        max_len = max(x.shape[0] for x in new_input_embeds)
+        #max_len = max(x.shape[0] for x in new_input_embeds)
+        max_len = 1024
         batch_size = len(new_input_embeds)
 
         new_input_embeds_padded = []
@@ -307,20 +321,33 @@ class LlavaMetaForCausalLM(ABC):
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
 
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
+        if self.is_hpu:
+            new_input_embeds = new_input_embeds.to(device='hpu')
 
         if _labels is None:
             new_labels = None
         else:
-            new_labels = new_labels_padded
+            if self.is_hpu:
+                new_labels = new_labels_padded.to(device='hpu')
+            else:
+                new_labels = new_labels_padded
+
 
         if _attention_mask is None:
             attention_mask = None
         else:
-            attention_mask = attention_mask.to(dtype=_attention_mask.dtype)
+            if self.is_hpu:
+                attention_mask = attention_mask.to(dtype=_attention_mask.dtype, device='hpu')
+            else:
+                attention_mask = attention_mask.to(dtype=_attention_mask.dtype)
 
         if _position_ids is None:
             position_ids = None
+        else:
+            if self.is_hpu:
+                position_ids = position_ids.to(device='hpu')
 
+        htorch.core.mark_step()
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):

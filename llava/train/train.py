@@ -25,6 +25,7 @@ from typing import Dict, Optional, Sequence, List
 import torch
 
 import transformers
+from transformers import HfArgumentParser
 import tokenizers
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
@@ -37,6 +38,7 @@ from llava.mm_utils import tokenizer_image_token
 
 from PIL import Image
 
+from optimum.habana import GaudiTrainingArguments, GaudiConfig
 
 local_rank = None
 
@@ -77,7 +79,7 @@ class DataArguments:
 
 
 @dataclass
-class TrainingArguments(transformers.TrainingArguments):
+class TrainingArguments(GaudiTrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)
@@ -788,7 +790,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
 def train(attn_implementation=None):
     global local_rank
 
-    parser = transformers.HfArgumentParser(
+    parser = HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
@@ -958,7 +960,9 @@ def train(attn_implementation=None):
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
+    gaudi_config = GaudiConfig.from_pretrained(training_args.gaudi_config_name)
     trainer = LLaVATrainer(model=model,
+                    gaudi_config=gaudi_config,
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
